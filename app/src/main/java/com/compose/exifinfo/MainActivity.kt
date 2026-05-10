@@ -517,30 +517,67 @@ private fun guessDevice(
     val pattern = Regex(
         pattern = "(?i)(?<![A-Za-z0-9])($brandPattern)(?:[ _+\\-./()]?[A-Za-z0-9][A-Za-z0-9 _+\\-.,()/]{0,48})?",
     )
-    val match = pattern.find(normalized) ?: return null
-    val guess = match.value
-        .trim()
-        .trim('|')
-        .takeIf { it.length in 3..56 } ?: return null
-    val contextRadius = 20
-    val contextStart = (match.range.first - contextRadius).coerceAtLeast(0)
-    val contextEndExclusive = (match.range.last + 1 + contextRadius).coerceAtMost(normalized.length)
-    val context = normalized
-        .substring(contextStart, contextEndExclusive)
-        .replace('\n', ' ')
-        .trim()
-    val guessLower = guess.lowercase()
-    val contextLower = context.lowercase()
-    val isInvalidGuess = INVALID_DEVICE_GUESS_MARKERS.any { marker ->
-        guessLower.contains(marker) || contextLower.contains(marker)
+    val candidates = mutableListOf<Pair<DeviceGuessMatch, Int>>()
+
+    for (match in pattern.findAll(normalized)) {
+        val guess = match.value
+            .trim()
+            .trim('|')
+            .takeIf { it.length in 3..56 } ?: continue
+        val contextRadius = 20
+        val contextStart = (match.range.first - contextRadius).coerceAtLeast(0)
+        val contextEndExclusive = (match.range.last + 1 + contextRadius).coerceAtMost(normalized.length)
+        val context = normalized
+            .substring(contextStart, contextEndExclusive)
+            .replace('\n', ' ')
+            .trim()
+        val guessLower = guess.lowercase()
+        val contextLower = context.lowercase()
+        val isInvalidGuess = INVALID_DEVICE_GUESS_MARKERS.any { marker ->
+            guessLower.contains(marker) || contextLower.contains(marker)
+        }
+
+        if (!isInvalidGuess) {
+            val candidate = DeviceGuessMatch(
+                guess = guess,
+                context = context,
+            )
+            candidates += candidate to scoreDeviceGuess(candidate)
+        }
     }
 
-    if (isInvalidGuess) return null
+    return candidates
+        .maxByOrNull { (_, score) -> score }
+        ?.first
+}
 
-    return DeviceGuessMatch(
-        guess = guess,
-        context = context,
-    )
+private fun scoreDeviceGuess(candidate: DeviceGuessMatch): Int {
+    val guess = candidate.guess
+    val lowerGuess = guess.lowercase()
+    var score = 0
+
+    if (guess.any { it.isDigit() }) score += 40
+    if (' ' in guess || '-' in guess || '_' in guess) score += 12
+    if (guess.length in 8..24) score += 10
+    if (guess.length > 24) score -= 8
+    if (guess.count { it.isDigit() } >= 2) score += 8
+    if (guess.any { it.isUpperCase() } && guess.any { it.isLowerCase() }) score += 4
+
+    val brand = DEVICE_BRAND_WHITELIST
+        .firstOrNull { lowerGuess.startsWith(it) }
+        .orEmpty()
+    if (brand.isNotBlank() && lowerGuess.length > brand.length) {
+        score += 20
+    }
+    if (brand.isNotBlank() && lowerGuess == brand) {
+        score -= 25
+    }
+
+    if (lowerGuess.contains("ultra") || lowerGuess.contains("pro") || lowerGuess.contains("plus")) {
+        score += 6
+    }
+
+    return score
 }
 
 private fun buildExifDeviceInfo(exifPairs: List<Pair<String, String>>): String? {
