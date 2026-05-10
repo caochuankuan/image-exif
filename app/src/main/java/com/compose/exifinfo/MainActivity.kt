@@ -61,8 +61,11 @@ import com.compose.exifinfo.ui.theme.ExifInfoTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.reflect.Modifier as ReflectModifier
+
+private const val METADATA_SCAN_LIMIT_BYTES = 4 * 1024 * 1024
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -260,13 +263,14 @@ private fun ExifInfoApp() {
 
 private fun parseMetadata(context: Context, uri: Uri): MetadataResult {
     return runCatching {
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: error("无法读取图片内容")
-        val firstHundredLines = buildPseudoLines(bytes).take(100)
+        val sampledBytes = context.contentResolver.openInputStream(uri)?.use {
+            readBytesCapped(it, METADATA_SCAN_LIMIT_BYTES)
+        } ?: error("无法读取图片内容")
+        val firstHundredLines = buildPseudoLines(sampledBytes).take(100)
         val rawJoinedText = firstHundredLines.joinToString("\n")
         val exif = context.contentResolver.openInputStream(uri)?.use { ExifInterface(it) }
         val exifPairs = buildExifPairs(exif)
-        val c2paPairs = buildC2paPairs(bytes)
+        val c2paPairs = buildC2paPairs(sampledBytes)
         val mappedInfo = buildMappedInfo(exifPairs, c2paPairs)
         MetadataResult(
             imageUri = uri,
@@ -285,6 +289,25 @@ private fun parseMetadata(context: Context, uri: Uri): MetadataResult {
             errorMessage = error.message ?: "解析失败",
         )
     }
+}
+
+private fun readBytesCapped(
+    inputStream: java.io.InputStream,
+    maxBytes: Int,
+): ByteArray {
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    val output = ByteArrayOutputStream(minOf(maxBytes, 256 * 1024))
+    var totalRead = 0
+
+    while (totalRead < maxBytes) {
+        val allowed = minOf(buffer.size, maxBytes - totalRead)
+        val count = inputStream.read(buffer, 0, allowed)
+        if (count <= 0) break
+        output.write(buffer, 0, count)
+        totalRead += count
+    }
+
+    return output.toByteArray()
 }
 
 private fun buildPseudoLines(bytes: ByteArray, lineWidth: Int = 64): List<String> {
