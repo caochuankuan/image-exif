@@ -51,7 +51,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -66,6 +65,87 @@ import java.io.File
 import java.lang.reflect.Modifier as ReflectModifier
 
 private const val METADATA_SCAN_LIMIT_BYTES = 4 * 1024 * 1024
+private const val TEXT_PREVIEW_LINE_COUNT = 200
+private val INVALID_DEVICE_GUESS_MARKERS = listOf(
+    "http://",
+    "https://",
+    ".com/",
+    ".org/",
+    ".net/",
+    "/photos/",
+    "/camera/",
+    "xmlns",
+    "ns.",
+    "schema",
+    "xmp",
+    "gcamera=",
+)
+private val DEVICE_BRAND_WHITELIST = listOf(
+    "apple",
+    "iphone",
+    "ipad",
+    "huawei",
+    "honor",
+    "xiaomi",
+    "redmi",
+    "meizu",
+    "vivo",
+    "oppo",
+    "oneplus",
+    "realme",
+    "iqoo",
+    "nubia",
+    "zte",
+    "lenovo",
+    "motorola",
+    "moto",
+    "smartisan",
+    "samsung",
+    "galaxy",
+    "google",
+    "pixel",
+    "sony",
+    "xperia",
+    "lg",
+    "htc",
+    "nokia",
+    "asus",
+    "rog",
+    "black shark",
+    "blackberry",
+    "nothing",
+    "cmf",
+    "tecno",
+    "infinix",
+    "itel",
+    "lava",
+    "micromax",
+    "sharp",
+    "panasonic",
+    "leica",
+    "hasseblad",
+    "hasselblad",
+    "canon",
+    "nikon",
+    "fujifilm",
+    "olympus",
+    "om system",
+    "pentax",
+    "ricoh",
+    "sigma",
+    "kodak",
+    "phase one",
+    "mamiya",
+    "contax",
+    "yashica",
+    "minolta",
+    "casio",
+    "gopro",
+    "insta360",
+    "dji",
+    "autel",
+    "parrot",
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,11 +161,18 @@ class MainActivity : ComponentActivity() {
 
 private data class MetadataResult(
     val imageUri: Uri,
+    val exifDeviceInfo: String?,
     val deviceGuess: String?,
+    val deviceGuessContext: String?,
     val mappedInfo: List<Pair<String, String>>,
     val fullInfo: List<Pair<String, String>>,
-    val firstHundredLines: List<String>,
+    val previewLines: List<String>,
     val errorMessage: String? = null,
+)
+
+private data class DeviceGuessMatch(
+    val guess: String,
+    val context: String,
 )
 
 @Composable
@@ -160,7 +247,7 @@ private fun ExifInfoApp() {
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    text = "选择照片后自动解析图片内容、EXIF 信息、C2PA 相关文本和前 100 行原始文本。",
+                    text = "选择照片后自动解析图片内容、EXIF 信息、C2PA 相关文本和前 200 行 UTF-8 文本。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -224,7 +311,11 @@ private fun ExifInfoApp() {
                         ImageSection(result.imageUri)
                     }
                     item {
-                        DeviceGuessSection(result.deviceGuess)
+                        DeviceGuessSection(
+                            exifDeviceInfo = result.exifDeviceInfo,
+                            deviceGuess = result.deviceGuess,
+                            deviceGuessContext = result.deviceGuessContext,
+                        )
                     }
                     item {
                         KeyValueSection(
@@ -242,8 +333,8 @@ private fun ExifInfoApp() {
                     }
                     item {
                         LinesSection(
-                            title = "照片前 100 行文本",
-                            lines = result.firstHundredLines,
+                            title = "照片前 200 行 UTF-8 文本",
+                            lines = result.previewLines,
                             emptyText = "没有可显示的文本",
                         )
                     }
@@ -266,26 +357,32 @@ private fun parseMetadata(context: Context, uri: Uri): MetadataResult {
         val sampledBytes = context.contentResolver.openInputStream(uri)?.use {
             readBytesCapped(it, METADATA_SCAN_LIMIT_BYTES)
         } ?: error("无法读取图片内容")
-        val firstHundredLines = buildPseudoLines(sampledBytes).take(100)
-        val rawJoinedText = firstHundredLines.joinToString("\n")
+        val previewLines = buildPseudoLines(sampledBytes).take(TEXT_PREVIEW_LINE_COUNT)
+        val rawJoinedText = previewLines.joinToString("\n")
         val exif = context.contentResolver.openInputStream(uri)?.use { ExifInterface(it) }
         val exifPairs = buildExifPairs(exif)
         val c2paPairs = buildC2paPairs(sampledBytes)
         val mappedInfo = buildMappedInfo(exifPairs, c2paPairs)
+        val exifDeviceInfo = buildExifDeviceInfo(exifPairs)
+        val deviceGuessMatch = guessDevice(rawJoinedText, exifPairs)
         MetadataResult(
             imageUri = uri,
-            deviceGuess = guessDevice(rawJoinedText, exifPairs),
+            exifDeviceInfo = exifDeviceInfo,
+            deviceGuess = deviceGuessMatch?.guess,
+            deviceGuessContext = deviceGuessMatch?.context,
             mappedInfo = mappedInfo,
             fullInfo = (exifPairs + c2paPairs).distinctBy { "${it.first}:${it.second}" },
-            firstHundredLines = firstHundredLines,
+            previewLines = previewLines,
         )
     }.getOrElse { error ->
         MetadataResult(
             imageUri = uri,
+            exifDeviceInfo = null,
             deviceGuess = null,
+            deviceGuessContext = null,
             mappedInfo = emptyList(),
             fullInfo = emptyList(),
-            firstHundredLines = emptyList(),
+            previewLines = emptyList(),
             errorMessage = error.message ?: "解析失败",
         )
     }
@@ -311,11 +408,11 @@ private fun readBytesCapped(
 }
 
 private fun buildPseudoLines(bytes: ByteArray, lineWidth: Int = 64): List<String> {
-    val rawText = bytes.toString(Charsets.ISO_8859_1)
+    val rawText = bytes.toString(Charsets.UTF_8)
     val normalized = rawText.map { char ->
         when {
             char == '\r' || char == '\n' -> '\n'
-            char.code in 32..126 -> char
+            !char.isISOControl() || char == '\t' -> char
             else -> '�'
         }
     }.joinToString("")
@@ -412,24 +509,48 @@ private fun extractPrintableStrings(
 private fun guessDevice(
     rawJoinedText: String,
     exifPairs: List<Pair<String, String>>,
-): String? {
+): DeviceGuessMatch? {
     val normalized = rawJoinedText.replace('�', '|')
+    val brandPattern = DEVICE_BRAND_WHITELIST
+        .sortedByDescending { it.length }
+        .joinToString("|") { Regex.escape(it) }
     val pattern = Regex(
-        pattern = "(?i)(apple|iphone|huawei|honor|xiaomi|redmi|mi|vivo|oppo|oneplus|samsung|google|pixel|canon|nikon|sony|fujifilm|dji)[A-Za-z0-9 _+\\-.,()/]{0,50}",
+        pattern = "(?i)(?<![A-Za-z0-9])($brandPattern)(?:[ _+\\-./()]?[A-Za-z0-9][A-Za-z0-9 _+\\-.,()/]{0,48})?",
     )
-    val match = pattern.find(normalized)?.value
-        ?.trim()
-        ?.trim('|')
-        ?.takeIf { it.length in 3..56 }
-
-    if (match != null) return match
-
-    val make = exifPairs.firstOrNull { it.first == "Make" }?.second
-    val model = exifPairs.firstOrNull { it.first == "Model" }?.second
-    return listOfNotNull(make, model)
-        .joinToString(" ")
+    val match = pattern.find(normalized) ?: return null
+    val guess = match.value
         .trim()
-        .ifBlank { null }
+        .trim('|')
+        .takeIf { it.length in 3..56 } ?: return null
+    val contextRadius = 20
+    val contextStart = (match.range.first - contextRadius).coerceAtLeast(0)
+    val contextEndExclusive = (match.range.last + 1 + contextRadius).coerceAtMost(normalized.length)
+    val context = normalized
+        .substring(contextStart, contextEndExclusive)
+        .replace('\n', ' ')
+        .trim()
+    val guessLower = guess.lowercase()
+    val contextLower = context.lowercase()
+    val isInvalidGuess = INVALID_DEVICE_GUESS_MARKERS.any { marker ->
+        guessLower.contains(marker) || contextLower.contains(marker)
+    }
+
+    if (isInvalidGuess) return null
+
+    return DeviceGuessMatch(
+        guess = guess,
+        context = context,
+    )
+}
+
+private fun buildExifDeviceInfo(exifPairs: List<Pair<String, String>>): String? {
+    val make = exifPairs.firstOrNull { it.first == "Make" }?.second?.trim().orEmpty()
+    val model = exifPairs.firstOrNull { it.first == "Model" }?.second?.trim().orEmpty()
+    return if (make.isNotBlank() && model.isNotBlank()) {
+        "$make $model".trim()
+    } else {
+        null
+    }
 }
 
 private fun buildMappedInfo(
@@ -540,7 +661,7 @@ private fun HintCard() {
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text("1. 首页支持“从相册选择”和“拍照”两个入口。")
-            Text("2. 选图后会依次展示图片、设备猜测、主要信息、完整 EXIF/C2PA、前 100 行文本。")
+            Text("2. 选图后会依次展示图片、设备猜测、主要信息、完整 EXIF/C2PA、前 200 行 UTF-8 文本。")
             Text("3. 每个区块、每一项文本都支持长按复制。")
         }
     }
@@ -578,18 +699,60 @@ private fun ImageSection(imageUri: Uri) {
 }
 
 @Composable
-private fun DeviceGuessSection(deviceGuess: String?) {
+private fun DeviceGuessSection(
+    exifDeviceInfo: String?,
+    deviceGuess: String?,
+    deviceGuessContext: String?,
+) {
     CopyableSectionCard(
         title = "设备猜测",
-        contentToCopy = deviceGuess ?: "未匹配到设备型号",
+        contentToCopy = listOfNotNull(
+            exifDeviceInfo?.let { "EXIF 设备信息: $it" },
+            deviceGuess?.let { "文本猜测: $it" },
+            deviceGuessContext?.let { "命中上下文: $it" },
+        ).joinToString("\n").ifBlank { "未匹配到设备型号" },
     ) {
+        if (exifDeviceInfo != null) {
+            Text(
+                text = "EXIF 设备信息",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = exifDeviceInfo,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+        }
+        Text(
+            text = "文本猜测",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = deviceGuess ?: "未匹配到设备型号",
-            style = MaterialTheme.typography.bodyLarge,
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold,
         )
+        if (deviceGuessContext != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "命中上下文（前后各 20 字符）",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = deviceGuessContext,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "规则：从图片前 100 行文本中尝试匹配品牌开头、到乱码前结束的型号区域；未命中时回退到 EXIF 的 Make / Model。",
+            text = "规则：文本猜测始终基于前 200 行文本和品牌白名单执行；如果 EXIF 的设备品牌与设备型号都存在，也会额外展示在上方。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -733,8 +896,6 @@ private fun CopyableText(label: String, value: String) {
         Text(
             text = value,
             style = MaterialTheme.typography.bodySmall,
-            maxLines = 6,
-            overflow = TextOverflow.Ellipsis,
         )
     }
 }
